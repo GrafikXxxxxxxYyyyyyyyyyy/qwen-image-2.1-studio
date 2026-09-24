@@ -22,11 +22,16 @@ from PIL import Image
 
 import prompts
 from backend import (
-    ASPECT_RATIOS,
     MAX_REFERENCE_IMAGES,
+    MAX_SIDE,
+    MIN_SIDE,
+    SIZE_MULTIPLE,
+    TURBO_STEPS,
     GenRequest,
+    clamp_size,
     load_backend,
-    size_for_ratio,
+    parse_ratio,
+    size_for_aspect,
     size_like_image,
 )
 from enhancer import PromptEnhancer
@@ -35,7 +40,7 @@ OUTPUT_DIR = Path(os.environ.get("QWEN_OUTPUT_DIR", "outputs"))
 RESOLUTIONS = [1024, 1536, 2048]
 MAX_SEED = 2**31 - 1
 SIZE_FOLLOW = "Как у изображения №"
-SIZE_RATIO = "Соотношение сторон"
+SIZE_CUSTOM = "Задать вручную"
 
 backend = load_backend()
 enhancer = PromptEnhancer(mock=backend.is_mock)
@@ -46,22 +51,24 @@ enhancer = PromptEnhancer(mock=backend.is_mock)
 # --------------------------------------------------------------------------- #
 def run(prompt: str, images: list[Image.Image], size: tuple[int, int] | None, ref_resolution: int,
         settings: list, progress: gr.Progress):
-    steps, seed, randomize, num_images, cfg_scale, negative, kv_cache = settings
+    steps, seed, randomize, num_images, cfg_scale, negative, kv_cache, turbo = settings
     if not prompt.strip():
         raise gr.Error("Пустой промпт")
     seed = random.randint(0, MAX_SEED) if randomize else int(seed)
+    turbo = bool(turbo) and backend.has_turbo
     req = GenRequest(
         prompt=prompt.strip(),
         images=images,
         width=size[0] if size else None,
         height=size[1] if size else None,
-        steps=int(steps),
+        steps=TURBO_STEPS if turbo else int(steps),
         seed=seed,
         negative_prompt=negative or "",
         true_cfg_scale=float(cfg_scale),
         output_resolution=int(ref_resolution),
         use_kv_cache=bool(kv_cache),
         num_images=int(num_images),
+        turbo=turbo,
     )
     width, height = req.resolved_size()
     progress(0, desc=f"Генерация {width}×{height}")
@@ -75,27 +82,31 @@ def run(prompt: str, images: list[Image.Image], size: tuple[int, int] | None, re
     saved = save_outputs(results, req)
     modes = sorted({im.mode for im in results})
     info = (
-        f"**{width}×{height}** · seed `{seed}` · {req.steps} шагов · {elapsed:.1f} с · {'/'.join(modes)}"
+        f"**{width}×{height}** · seed `{seed}` · {req.steps} шагов{' ⚡ turbo' if turbo else ''}"
+        f" · {elapsed:.1f} с · {'/'.join(modes)}"
         + (f" · референсов: {len(images)}" if images else "")
-        + (f" · CFG {req.true_cfg_scale}" if req.negative_prompt and req.true_cfg_scale > 1 else "")
-        + (f"  \nСохранено: `{saved}`" if saved else "")
+        + (f" · CFG {req.true_cfg_scale}" if req.negative_prompt and req.true_cfg_scale > 1 and not turbo else "")
+        + (f"  \nСохранено: `{saved[0].with_name(saved[0].stem.rsplit('_', 1)[0])}`" if saved else "")
         + ("  \n⚠️ Заглушка: картинки ненастоящие" if backend.is_mock else "")
     )
-    return results, req.prompt, info, seed
+    # Галерея показывает сжатый WebP (PNG 2K — 6–8 MB, через туннель это минуты); оригиналы — файлами.
+    return results, req.prompt, info, seed, [str(p) for p in saved] or None
 
 
-def save_outputs(results: list[Image.Image], req: GenRequest) -> str | None:
+def save_outputs(results: list[Image.Image], req: GenRequest) -> list[Path]:
     if backend.is_mock:
-        return None
+        return []
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stem = f"{datetime.now():%Y%m%d-%H%M%S}_{req.seed}"
+    paths = []
     for i, im in enumerate(results):
-        im.save(OUTPUT_DIR / f"{stem}_{i}.png")
+        paths.append(OUTPUT_DIR / f"{stem}_{i}.png")
+        im.save(paths[-1])
     meta = {k: v for k, v in vars(req).items() if k != "images"}
     meta["num_reference_images"] = len(req.images)
     meta["size"] = req.resolved_size()
     (OUTPUT_DIR / f"{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-    return str(OUTPUT_DIR / stem)
+    return paths
 
 
 def gallery_images(value) -> list[Image.Image]:
@@ -107,32 +118,38 @@ def gallery_images(value) -> list[Image.Image]:
     return images
 
 
-def output_size(images, mode, follow_idx, ratio, resolution) -> tuple[int, int]:
+def output_size(images, mode, follow_idx, resolution, width, height) -> tuple[int, int]:
     if mode == SIZE_FOLLOW:
         idx = int(follow_idx)
         if not 1 <= idx <= len(images):
             raise gr.Error(f"Нет изображения №{idx}: загружено {len(images)}")
         return size_like_image(images[idx - 1], int(resolution))
-    return size_for_ratio(ratio, int(resolution))
+    return clamp_size(width, height)
+
+
+def size_from_ratio(ratio: str, width: float, height: float) -> tuple[int, int] | None:
+    """Соотношение сторон от переписчика промптов → размер той же площади, что сейчас на ползунках."""
+    aspect = parse_ratio(ratio)
+    return size_for_aspect(aspect, round((width * height) ** 0.5)) if aspect else None
 
 
 # --------------------------------------------------------------------------- #
 # Обработчики вкладок
 # --------------------------------------------------------------------------- #
-def t2i(prompt, rgba, ratio, resolution, *settings, progress=gr.Progress()):
+def t2i(prompt, rgba, width, height, *settings, progress=gr.Progress()):
     prompt = prompts.wrap_rgba(prompt) if rgba else prompt
-    return run(prompt, [], size_for_ratio(ratio, int(resolution)), 1024, list(settings), progress)
+    return run(prompt, [], clamp_size(width, height), 1024, list(settings), progress)
 
 
-def rewrite_t2i(prompt):
+def rewrite_t2i(prompt, width, height):
     if not prompt.strip():
         raise gr.Error("Пустой промпт")
     r = enhancer.rewrite("t2i", prompt)
-    ratio = gr.update(value=r.wh_ratio) if r.wh_ratio in ASPECT_RATIOS else gr.update()
-    return r.prompt, ratio, format_thinking(r)
+    w, h = size_from_ratio(r.wh_ratio, width, height) or (gr.update(), gr.update())
+    return r.prompt, w, h, format_thinking(r)
 
 
-def edit(gallery, instruction, rgba, size_mode, follow_idx, ratio, out_res, ref_res, *settings,
+def edit(gallery, instruction, rgba, size_mode, follow_idx, out_res, width, height, ref_res, *settings,
          progress=gr.Progress()):
     images = gallery_images(gallery)
     if not images:
@@ -140,21 +157,21 @@ def edit(gallery, instruction, rgba, size_mode, follow_idx, ratio, out_res, ref_
     if len(images) > MAX_REFERENCE_IMAGES:
         raise gr.Error(f"Модель принимает не больше {MAX_REFERENCE_IMAGES} изображений, загружено {len(images)}")
     prompt = prompts.wrap_rgba(instruction) if rgba else instruction
-    size = output_size(images, size_mode, follow_idx, ratio, out_res)
+    size = output_size(images, size_mode, follow_idx, out_res, width, height)
     return run(prompt, images, size, ref_res, list(settings), progress)
 
 
-def rewrite_edit(gallery, instruction):
+def rewrite_edit(gallery, instruction, width, height):
     images = gallery_images(gallery)
     if not images or not instruction.strip():
         raise gr.Error("Нужны изображения и инструкция")
     r = enhancer.rewrite("edit", instruction, images)
-    mode, idx, ratio = gr.update(), gr.update(), gr.update()
+    mode, idx, w, h = gr.update(), gr.update(), gr.update(), gr.update()
     if follow := re.fullmatch(r"<image(\d+)>", r.ratio_follow):
         mode, idx = SIZE_FOLLOW, int(follow.group(1))
-    elif r.wh_ratio in ASPECT_RATIOS:
-        mode, ratio = SIZE_RATIO, r.wh_ratio
-    return r.prompt, mode, idx, ratio, format_thinking(r)
+    elif size := size_from_ratio(r.wh_ratio, width, height):
+        mode, (w, h) = SIZE_CUSTOM, size
+    return r.prompt, mode, idx, w, h, format_thinking(r)
 
 
 def format_thinking(r) -> str:
@@ -183,8 +200,7 @@ def local_edit(editor, mode, instruction, template, out_res, *settings, progress
         color = prompts.annotation_color(editor)
         prompt = prompts.fill(template, instruction=prompts.sentence(instruction), color=color)
         images, preview = [composite], composite
-    results, used_prompt, info, seed = run(prompt, images, size, out_res, list(settings), progress)
-    return results, used_prompt, info, seed, preview
+    return *run(prompt, images, size, out_res, list(settings), progress), preview
 
 
 def transparency(image, mode, text, template, out_res, *settings, progress=gr.Progress()):
@@ -204,7 +220,13 @@ def transparency(image, mode, text, template, out_res, *settings, progress=gr.Pr
 # Интерфейс
 # --------------------------------------------------------------------------- #
 CSS = """
-.checker img { background: repeating-conic-gradient(#d9d9d9 0 25%, #ffffff 0 50%) 50% / 20px 20px; }
+/* Шахматка под прозрачными картинками. Gradio растягивает <img> на всю рамку и вписывает картинку через
+   object-fit: contain — фон тогда закрашивает и поля вокруг, будто картинка больше и прозрачная.
+   Поэтому <img> сжимается до размеров самой картинки и центруется. */
+.checker img { width: auto !important; height: auto !important; max-width: 100%; max-height: 100%;
+               margin: auto; object-fit: contain;
+               background: repeating-conic-gradient(#d9d9d9 0 25%, #ffffff 0 50%) 50% / 20px 20px; }
+.checker .thumbnail-lg, .checker .media-button { display: flex; align-items: center; justify-content: center; }
 .mock-banner { background: rgba(255, 193, 7, 0.15); border: 1px solid rgba(255, 193, 7, 0.6);
                padding: 8px 12px; border-radius: 8px; }
 """
@@ -223,6 +245,10 @@ HELP_MD = f"""
 **Разрешение референсов.** Каждый референс приводится к площади N×N и превращается в токены
 (1024² → 4096 токенов, 2048² → 16384). С большим количеством референсов держите 1024.
 
+**Turbo.** Дистиллированная LoRA от Viggle ([Qwen-Image-2.1-viggle-turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo)):
+{TURBO_STEPS} шагов по фиксированному расписанию, CFG и negative prompt игнорируются. Обучена на 1–3 референсах;
+на сложных правках (композиция из многих картинок, замена лиц) база на 40 шагах заметно точнее.
+
 **Без CFG.** Модель рассчитана на генерацию без guidance. Negative prompt работает только при
 CFG > 1 и удваивает время шага.
 
@@ -238,7 +264,12 @@ CFG > 1 и удваивает время шага.
 def settings_sidebar():
     with gr.Sidebar(open=True):
         gr.Markdown("### Параметры генерации")
-        steps = gr.Slider(4, 80, value=40, step=1, label="Шаги", info="Рекомендовано: 40")
+        turbo = gr.Checkbox(value=backend.has_turbo, interactive=backend.has_turbo,
+                            label=f"⚡ Turbo: {TURBO_STEPS} шагов вместо 40",
+                            info="LoRA Viggle, в ~5 раз быстрее. Без CFG; на сложных правках "
+                                 "(много референсов, лица) слабее базы" if backend.has_turbo
+                                 else "Turbo-LoRA не загружена (QWEN_TURBO=0)")
+        steps = gr.Slider(4, 80, value=40, step=1, label="Шаги", info="Рекомендовано: 40. В turbo не используется")
         seed = gr.Number(value=42, precision=0, minimum=0, maximum=MAX_SEED, label="Seed")
         randomize = gr.Checkbox(value=True, label="Случайный seed при каждом запуске")
         num_images = gr.Slider(1, 4, value=1, step=1, label="Картинок за раз")
@@ -249,15 +280,34 @@ def settings_sidebar():
                                   info="> 1 включает CFG, нужен negative prompt")
             negative = gr.Textbox(label="Negative prompt", lines=2)
         gr.Markdown(f"<small>{backend.description}<br>{enhancer.status()}</small>")
-    return [steps, seed, randomize, num_images, cfg_scale, negative, kv_cache], seed
+    return [steps, seed, randomize, num_images, cfg_scale, negative, kv_cache, turbo], seed
 
 
 def result_column():
-    gallery = gr.Gallery(label="Результат", format="png", type="pil", columns=2, height=560,
+    gallery = gr.Gallery(label="Результат", format="webp", type="pil", columns=2, height=560,
                          elem_classes="checker", interactive=False)
     info = gr.Markdown()
+    files = gr.File(label="Оригиналы PNG", file_count="multiple", interactive=False, height=110)
     used_prompt = gr.Textbox(label="Промпт, отправленный в модель", lines=3, interactive=False)
-    return gallery, used_prompt, info
+    return gallery, used_prompt, info, files
+
+
+def size_sliders(width: int, height: int):
+    """Ширина и высота вывода + кнопка, меняющая их местами."""
+    with gr.Row(equal_height=True) as row:
+        w = gr.Slider(MIN_SIDE, MAX_SIDE, value=width, step=SIZE_MULTIPLE, label="Ширина", scale=4)
+        h = gr.Slider(MIN_SIDE, MAX_SIDE, value=height, step=SIZE_MULTIPLE, label="Высота", scale=4)
+        swap = gr.Button("⇄", scale=0, min_width=48)
+    swap.click(lambda a, b: (b, a), [w, h], [w, h], queue=False)
+    gr.Markdown(f"<small>Кратно {SIZE_MULTIPLE}. Модель обучена на площадях 1024²–2048² (до 2752 по длинной "
+                f"стороне); 2048² на A6000 — ~30 с в turbo.</small>")
+    return row, w, h
+
+
+def resolution_slider(label: str):
+    """Площадь вывода, когда пропорции задаёт исходная картинка."""
+    return gr.Slider(MIN_SIDE, 2048, value=1024, step=SIZE_MULTIPLE, label=label,
+                     info="Сторона квадрата той же площади; пропорции — как у исходной картинки")
 
 
 def pe_button(task: str):
@@ -281,18 +331,16 @@ def build_ui() -> gr.Blocks:
                     t_prompt = gr.Textbox(label="Промпт", lines=5, placeholder=(
                         'A neon shop sign that reads "QWEN IMAGE 2.1", rainy night, reflections on wet pavement'))
                     t_rgba = gr.Checkbox(label="Прозрачный фон (RGBA)")
-                    t_ratio = gr.Radio(list(ASPECT_RATIOS), value="1:1", label="Соотношение сторон")
-                    t_res = gr.Radio(RESOLUTIONS, value=2048, label="Разрешение (длина стороны квадрата)",
-                                     info="Модель родная для 2K; 1024 — быстрее и легче")
+                    _, t_w, t_h = size_sliders(2048, 2048)
                     with gr.Row():
                         t_rewrite = pe_button("t2i")
                         t_go = gr.Button("Сгенерировать", variant="primary")
                     with gr.Accordion("Рассуждение переписчика промптов", open=False):
                         t_thinking = gr.Textbox(lines=10, show_label=False, interactive=False)
                 with gr.Column():
-                    t_out, t_used, t_info = result_column()
-            t_rewrite.click(rewrite_t2i, [t_prompt], [t_prompt, t_ratio, t_thinking])
-            t_go.click(t2i, [t_prompt, t_rgba, t_ratio, t_res, *settings], [t_out, t_used, t_info, seed_box])
+                    t_out, t_used, t_info, t_files = result_column()
+            t_rewrite.click(rewrite_t2i, [t_prompt, t_w, t_h], [t_prompt, t_w, t_h, t_thinking])
+            t_go.click(t2i, [t_prompt, t_rgba, t_w, t_h, *settings], [t_out, t_used, t_info, seed_box, t_files])
 
         # ---------------- Редактирование / референсы ----------------
         with gr.Tab("Редактирование и референсы"):
@@ -304,24 +352,28 @@ def build_ui() -> gr.Blocks:
                         "Change the background to a sunset beach\n"
                         "или: The people from <image1> and <image2> sit together at a cafe table"))
                     e_rgba = gr.Checkbox(label="Результат с прозрачным фоном (RGBA)")
-                    with gr.Row():
-                        e_size_mode = gr.Radio([SIZE_FOLLOW, SIZE_RATIO], value=SIZE_FOLLOW, label="Размер вывода")
+                    e_size_mode = gr.Radio([SIZE_FOLLOW, SIZE_CUSTOM], value=SIZE_FOLLOW, label="Размер вывода")
+                    with gr.Row() as e_follow_row:
                         e_follow = gr.Number(value=1, precision=0, minimum=1, maximum=MAX_REFERENCE_IMAGES,
-                                             label="№ изображения")
-                    e_ratio = gr.Radio(list(ASPECT_RATIOS), value="1:1", label="Соотношение сторон")
-                    with gr.Row():
-                        e_out_res = gr.Radio(RESOLUTIONS, value=1024, label="Разрешение вывода")
-                        e_ref_res = gr.Radio(RESOLUTIONS, value=1024, label="Разрешение референсов")
+                                             label="№ изображения", scale=1)
+                        e_out_res = resolution_slider("Разрешение вывода")
+                    with gr.Column(visible=False) as e_custom_col:
+                        _, e_w, e_h = size_sliders(1024, 1024)
+                    e_ref_res = gr.Radio(RESOLUTIONS, value=1024, label="Разрешение референсов",
+                                         info="Площадь, к которой приводится каждая входная картинка")
                     with gr.Row():
                         e_rewrite = pe_button("edit")
                         e_go = gr.Button("Сгенерировать", variant="primary")
                     with gr.Accordion("Рассуждение переписчика промптов", open=False):
                         e_thinking = gr.Textbox(lines=10, show_label=False, interactive=False)
                 with gr.Column():
-                    e_out, e_used, e_info = result_column()
-            e_rewrite.click(rewrite_edit, [e_images, e_prompt], [e_prompt, e_size_mode, e_follow, e_ratio, e_thinking])
-            e_go.click(edit, [e_images, e_prompt, e_rgba, e_size_mode, e_follow, e_ratio, e_out_res, e_ref_res,
-                              *settings], [e_out, e_used, e_info, seed_box])
+                    e_out, e_used, e_info, e_files = result_column()
+            e_size_mode.change(lambda m: (gr.Row(visible=m == SIZE_FOLLOW), gr.Column(visible=m == SIZE_CUSTOM)),
+                               e_size_mode, [e_follow_row, e_custom_col], queue=False)
+            e_rewrite.click(rewrite_edit, [e_images, e_prompt, e_w, e_h],
+                            [e_prompt, e_size_mode, e_follow, e_w, e_h, e_thinking])
+            e_go.click(edit, [e_images, e_prompt, e_rgba, e_size_mode, e_follow, e_out_res, e_w, e_h, e_ref_res,
+                              *settings], [e_out, e_used, e_info, seed_box, e_files])
 
         # ---------------- Локальная правка ----------------
         with gr.Tab("Локальная правка"):
@@ -340,16 +392,16 @@ def build_ui() -> gr.Blocks:
                     l_prompt = gr.Textbox(label="Что сделать", lines=3,
                                           placeholder="Replace the cup with a glass of orange juice.")
                     l_template = gr.Textbox(label="Шаблон промпта", value=prompts.ANNOTATION_TEMPLATE, lines=4)
-                    l_out_res = gr.Radio(RESOLUTIONS, value=1024, label="Разрешение")
+                    l_out_res = resolution_slider("Разрешение")
                     l_go = gr.Button("Применить", variant="primary")
                 with gr.Column():
-                    l_out, l_used, l_info = result_column()
+                    l_out, l_used, l_info, l_files = result_column()
                     l_preview = gr.Image(label="Что ушло в модель как пометка/маска", type="pil",
                                          interactive=False, height=240)
             l_mode.change(lambda m: prompts.MASK_TEMPLATE if m == "mask" else prompts.ANNOTATION_TEMPLATE,
                           l_mode, l_template)
             l_go.click(local_edit, [l_editor, l_mode, l_prompt, l_template, l_out_res, *settings],
-                       [l_out, l_used, l_info, seed_box, l_preview])
+                       [l_out, l_used, l_info, seed_box, l_files, l_preview])
 
         # ---------------- Прозрачность ----------------
         with gr.Tab("Прозрачность"):
@@ -364,10 +416,10 @@ def build_ui() -> gr.Blocks:
                     a_text = gr.Textbox(label="Что вырезать", placeholder="the red sports car")
                     a_template = gr.Textbox(label="Шаблон (обернётся в RGBA-шаблон)",
                                             value=prompts.EXTRACT_TEMPLATE, lines=3)
-                    a_out_res = gr.Radio(RESOLUTIONS, value=1024, label="Разрешение")
+                    a_out_res = resolution_slider("Разрешение")
                     a_go = gr.Button("Сгенерировать", variant="primary")
                 with gr.Column():
-                    a_out, a_used, a_info = result_column()
+                    a_out, a_used, a_info, a_files = result_column()
 
             def switch_alpha_mode(mode):
                 if mode == "extract":
@@ -378,7 +430,7 @@ def build_ui() -> gr.Blocks:
 
             a_mode.change(switch_alpha_mode, a_mode, [a_text, a_template])
             a_go.click(transparency, [a_image, a_mode, a_text, a_template, a_out_res, *settings],
-                       [a_out, a_used, a_info, seed_box])
+                       [a_out, a_used, a_info, seed_box, a_files])
 
         with gr.Tab("Справка"):
             gr.Markdown(HELP_MD)

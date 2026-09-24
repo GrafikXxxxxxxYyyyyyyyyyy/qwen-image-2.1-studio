@@ -4,6 +4,7 @@ transformers>=5.17
 # QwenImage21Pipeline есть только в main (релиз 0.40.0 вышел раньше). Зафиксирован коммит от 2026-09-24.
 diffusers @ git+https://github.com/huggingface/diffusers@e0118ade2f60234c41bacf40330a7e2f61108849
 accelerate
+peft  # turbo-LoRA (QWEN_TURBO=1)
 huggingface_hub
 gradio>=6.28,<7
 pillow>=10.1
