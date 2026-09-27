@@ -46,6 +46,11 @@ EXTRACT_TEMPLATE = (
 
 LAYER_EDIT_TEMPLATE = "{instruction} Keep the background transparent"
 
+BACKGROUND_TEMPLATE = (
+    "Place the object from the image into a new scene: {instruction} Keep the object's shape, colors "
+    "and details exactly unchanged, and match the lighting, shadows and perspective of the scene"
+)
+
 
 def sentence(text: str) -> str:
     """Инструкция как законченное предложение, чтобы не сливалась с остальным шаблоном."""
@@ -56,6 +61,22 @@ def sentence(text: str) -> str:
 def fill(template: str, **values: str) -> str:
     """Подставляет только известные плейсхолдеры, остальные фигурные скобки оставляет как есть."""
     return re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), template)
+
+
+def flatten_alpha(image: Image.Image, color: tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
+    """Картинка с прозрачностью → RGB на однотонном фоне.
+
+    Пайплайн отдаёт референс в VAE всеми четырьмя каналами, и модель переносит прозрачность в результат:
+    фон вокруг вырезанного объекта остаётся прозрачным, что бы ни просил промпт. Под прозрачными пикселями
+    у вырезок ещё и лежит случайный цвет (у RGBA-выхода модели — фиолетовый), который просто `convert("RGB")`
+    вытащил бы наружу. Белый — как у vision-энкодера пайплайна, он видит RGBA-референсы поверх белого.
+    """
+    if image.mode not in ("RGBA", "LA", "PA") and not (image.mode == "P" and "transparency" in image.info):
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    canvas = Image.new("RGB", rgba.size, color)
+    canvas.paste(rgba, (0, 0), rgba)
+    return canvas
 
 
 NAMED_COLORS = {

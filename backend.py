@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 import re
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -25,6 +27,15 @@ from PIL import Image, ImageDraw, ImageFont
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen-Image-2.1")
+
+# Трансформер по умолчанию — GGUF-квант uncensored-версии: Q8_0 ≈ 7 GB вместо 14 GB в bf16, чтобы вместе с
+# turbo-LoRA и 2K-генерацией уложиться в 24 GB (RTX 3090/4090). Энкодер, VAE и конфиги берутся из MODEL_ID.
+# https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF (лицензия Qwen Research, как у модели).
+# QWEN_GGUF=none — оригинальный bf16-трансформер из MODEL_ID.
+GGUF_REPO = os.environ.get("QWEN_GGUF_REPO", "abenzerps/Qwen-Image-2.1-Uncensored-GGUF")
+GGUF_FILE = os.environ.get("QWEN_GGUF", "qwen-image-2.1-UC-Q8_0.gguf")
+if GGUF_FILE.lower() in ("", "0", "none"):
+    GGUF_FILE = ""
 
 # Turbo: DMD-дистилляция от Viggle, LoRA поверх базового трансформера. 6 шагов по фиксированным sigma, без CFG.
 # https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo (лицензия Qwen Research, как у модели).
@@ -114,6 +125,34 @@ def drop_opaque_alpha(image: Image.Image) -> Image.Image:
     return image
 
 
+# Выше этого (ширина × высота × число картинок) на картах < 40 GB VAE сразу декодирует тайлами.
+# 1024² без тайлинга на 24 GB проходит (пик ~16 GB), 2048² — нет.
+TILE_UPFRONT_PIXELS = 1280 * 1280
+
+
+def _load_gguf_transformer(model_id: str, repo: str, filename: str):
+    import torch
+    from diffusers import GGUFQuantizationConfig, QwenImage21Transformer2DModel
+    from diffusers.quantizers.gguf.utils import GGUFLinear, dequantize_gguf_tensor
+    from huggingface_hub import hf_hub_download
+
+    transformer = QwenImage21Transformer2DModel.from_single_file(
+        hf_hub_download(repo, filename),
+        quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16),
+        config=model_id, subfolder="transformer", torch_dtype=torch.bfloat16,
+    )
+    # stable-diffusion.cpp хранит мелкие тензоры (нормы, txt_in) в BF16, а diffusers грузит BF16 из GGUF как сырые
+    # байты и распаковывает их только в GGUFLinear. Остальные модули (RMSNorm) получили бы uint8 двойной длины.
+    for module in transformer.modules():
+        if isinstance(module, GGUFLinear):
+            continue
+        for name, param in list(module.named_parameters(recurse=False)):
+            if hasattr(param, "quant_type"):
+                unpacked = dequantize_gguf_tensor(param).to(torch.bfloat16)
+                setattr(module, name, torch.nn.Parameter(unpacked, requires_grad=False))
+    return transformer
+
+
 class DiffusersBackend:
     is_mock = False
 
@@ -122,14 +161,17 @@ class DiffusersBackend:
         from diffusers import QwenImage21Pipeline
 
         self._torch = torch
-        pipe = QwenImage21Pipeline.from_pretrained(MODEL_ID, dtype=torch.bfloat16)
+        # Переданный трансформер from_pretrained не скачивает — из MODEL_ID идут только энкодер, VAE и конфиги.
+        extra = {"transformer": _load_gguf_transformer(MODEL_ID, GGUF_REPO, GGUF_FILE)} if GGUF_FILE else {}
+        pipe = QwenImage21Pipeline.from_pretrained(MODEL_ID, dtype=torch.bfloat16, **extra)
 
         vram_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+        self._vram_gb = vram_gb
         offload = os.environ.get("QWEN_OFFLOAD", "auto")
         if offload == "auto":
-            # Веса: энкодер ≈ 17 GB, трансформер ≈ 14 GB, VAE < 1 GB. Денойзинг на 2K — до ~18 GB с весами
-            # трансформера, декодирование VAE на 2K — ещё ~26 GB сверху.
-            offload = "none" if vram_gb >= 64 else "encoder" if vram_gb >= 40 else "model"
+            # Веса: энкодер ≈ 17 GB, трансформер ≈ 14 GB (GGUF Q8_0 ≈ 7 GB), turbo-LoRA ≈ 1.3 GB, VAE < 1 GB.
+            # Денойзинг добавляет к весам до ~4 GB на 2K, декодирование VAE на 2K — ещё ~26 GB (с тайлингом — ~2 GB).
+            offload = "none" if vram_gb >= 64 else "encoder" if vram_gb >= (20 if GGUF_FILE else 40) else "model"
         if offload == "model":
             # Гоняет и трансформер через PCIe на каждой генерации: на A6000 +40 с к 1024².
             pipe.enable_model_cpu_offload()
@@ -166,12 +208,23 @@ class DiffusersBackend:
             pipe.transformer.set_attn_processor(QwenImage21FlexAttnProcessor())
             pipe.transformer.compile()
 
+        if offload == "encoder":
+            # С use_stream порядок слоёв записывается на первом проходе, и дальше каждый слой подгружает
+            # следующий вместо себя. Если первой была генерация с картинками, в цепочку попадает vision-энкодер,
+            # которого нет в text-to-image: цепочка рвётся, и rotary-слой (только буферы, без параметров —
+            # запасная синхронная подгрузка diffusers его не видит) остаётся на CPU: «tensors on different
+            # devices». Прогон без картинок записывает только общие слои, а слои vision-энкодера остаются вне
+            # цепочки и подгружают себя сами. Без use_stream генерация медленнее на ~10 с.
+            # Строго после load_lora_weights: она заново вешает хуки offloading и сбрасывает записанный порядок.
+            with torch.inference_mode():
+                pipe.encode_prompt("warmup", device=torch.device("cuda"))
+
         self.pipe = pipe
         # Один GPU — одна генерация за раз; очередь держит Gradio.
         self._lock = threading.Lock()
         gpu = torch.cuda.get_device_name(0)
         self.description = (
-            f"{MODEL_ID} · {gpu} ({vram_gb:.0f} GB) · offload: {offload}"
+            f"{f'{GGUF_REPO}/{GGUF_FILE}' if GGUF_FILE else MODEL_ID} · {gpu} ({vram_gb:.0f} GB) · offload: {offload}"
             + (" · turbo LoRA" if self.has_turbo else "")
             + (" · flex+compile" if compiled else "")
         )
@@ -202,25 +255,45 @@ class DiffusersBackend:
 
             kwargs["callback_on_step_end"] = on_step_end
 
+        # Декодирование VAE без тайлинга — ~6 GB на мегапиксель вывода. На картах меньше 40 GB крупный вывод
+        # сразу декодируем тайлами: иначе OOM случится после всего денойзинга, и генерация пойдёт заново.
+        width, height = req.resolved_size()
+        tile_upfront = self._vram_gb < 40 and width * height * req.num_images > TILE_UPFRONT_PIXELS
+
         with self._lock, torch.inference_mode():
             if self.has_turbo:
                 (self.pipe.enable_lora if turbo else self.pipe.disable_lora)()
                 self.pipe.scheduler = self._schedulers[turbo]
-            try:
-                images = self._run(kwargs, req.seed)
-            except torch.OutOfMemoryError:
-                images = None
+            images = None
+            if not tile_upfront:
+                try:
+                    images = self._run(kwargs, req.seed)
+                except torch.OutOfMemoryError as e:
+                    self._release(e)
             if images is None:
-                # Повтор — вне `except`: traceback держит тензоры первой попытки, и память не освободилась бы.
                 # Обычно OOM — это декодирование VAE (большой размер, несколько картинок). С тайлингом оно
-                # укладывается в память, но медленнее на ~10 с — поэтому только как повторная попытка.
-                torch.cuda.empty_cache()
+                # укладывается в память, но медленнее на ~10 с — поэтому на больших картах только как повтор.
                 self.pipe.vae.enable_tiling()
                 try:
                     images = self._run(kwargs, req.seed)
+                except BaseException as e:
+                    self._release(e)
+                    raise
                 finally:
                     self.pipe.vae.disable_tiling()
         return [drop_opaque_alpha(im) for im in images]
+
+    def _release(self, exc: BaseException) -> None:
+        """Освобождает видеопамять упавшей генерации.
+
+        Traceback исключения держит фреймы пайплайна со всеми тензорами (KV-кэш, латенты, эмбеддинги),
+        а само исключение живёт дольше генерации: app.py заворачивает его в gr.Error (`from e`), а Gradio
+        хранит ошибку. Без очистки фреймов после первого OOM в VRAM застревают десятки GB и падают
+        все следующие генерации.
+        """
+        traceback.clear_frames(exc.__traceback__)
+        gc.collect()
+        self._torch.cuda.empty_cache()
 
     def _run(self, kwargs: dict, seed: int) -> list[Image.Image]:
         # Генератор каждый раз свежий: повтор после OOM должен дать ту же картинку.

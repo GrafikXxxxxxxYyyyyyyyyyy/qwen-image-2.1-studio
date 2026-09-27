@@ -157,6 +157,8 @@ def edit(gallery, instruction, rgba, size_mode, follow_idx, out_res, width, heig
     if len(images) > MAX_REFERENCE_IMAGES:
         raise gr.Error(f"Модель принимает не больше {MAX_REFERENCE_IMAGES} изображений, загружено {len(images)}")
     prompt = prompts.wrap_rgba(instruction) if rgba else instruction
+    if not rgba:  # иначе прозрачность референсов переходит в результат
+        images = [prompts.flatten_alpha(im) for im in images]
     size = output_size(images, size_mode, follow_idx, out_res, width, height)
     return run(prompt, images, size, ref_res, list(settings), progress)
 
@@ -189,14 +191,14 @@ def local_edit(editor, mode, instruction, template, out_res, *settings, progress
         raise gr.Error("На изображении ничего не нарисовано — отметьте область кистью")
     if not instruction.strip():
         raise gr.Error("Опишите, что сделать с отмеченной областью")
-    background = background.convert("RGB")
+    background = prompts.flatten_alpha(background)
     size = size_like_image(background, int(out_res))
 
     if mode == "mask":
         prompt = prompts.fill(template, instruction=prompts.sentence(instruction))
         images, preview = [background, mask.convert("RGB")], mask
     else:
-        composite = editor["composite"].convert("RGB")
+        composite = prompts.flatten_alpha(editor["composite"])
         color = prompts.annotation_color(editor)
         prompt = prompts.fill(template, instruction=prompts.sentence(instruction), color=color)
         images, preview = [composite], composite
@@ -206,13 +208,18 @@ def local_edit(editor, mode, instruction, template, out_res, *settings, progress
 def transparency(image, mode, text, template, out_res, *settings, progress=gr.Progress()):
     if image is None:
         raise gr.Error("Загрузите изображение")
+    size = size_like_image(image, int(out_res))
+    if mode == "background":
+        if not text.strip():
+            raise gr.Error("Опишите фон или сцену")
+        prompt = prompts.fill(template, instruction=prompts.sentence(text))
+        return run(prompt, [prompts.flatten_alpha(image)], size, out_res, list(settings), progress)
     if mode == "extract":
         body = prompts.fill(template, subject=text.strip() or "the main subject")
     else:
         if not text.strip():
             raise gr.Error("Опишите правку слоя")
         body = prompts.fill(template, instruction=prompts.sentence(text))
-    size = size_like_image(image, int(out_res))
     return run(prompts.wrap_rgba(body), [image], size, out_res, list(settings), progress)
 
 
@@ -406,15 +413,17 @@ def build_ui() -> gr.Blocks:
         # ---------------- Прозрачность ----------------
         with gr.Tab("Прозрачность"):
             gr.Markdown("Генерация RGBA по тексту — галочка на первой вкладке. Здесь — вырезание объекта "
-                        "из фото и правка прозрачного слоя. *Шаблоны экспериментальные.*")
+                        "из фото, правка прозрачного слоя и фон вокруг вырезанного объекта. *Шаблоны экспериментальные.*")
             with gr.Row():
                 with gr.Column():
                     a_image = gr.Image(label="Изображение (PNG с альфой для правки слоя)", type="pil",
                                        image_mode="RGBA", format="png", height=400, elem_classes="checker")
                     a_mode = gr.Radio([("Вырезать объект из фото", "extract"),
-                                       ("Изменить прозрачный слой", "layer")], value="extract", label="Режим")
+                                       ("Изменить прозрачный слой", "layer"),
+                                       ("Дорисовать фон вокруг объекта", "background")],
+                                      value="extract", label="Режим")
                     a_text = gr.Textbox(label="Что вырезать", placeholder="the red sports car")
-                    a_template = gr.Textbox(label="Шаблон (обернётся в RGBA-шаблон)",
+                    a_template = gr.Textbox(label="Шаблон (кроме «Дорисовать фон» обернётся в RGBA-шаблон)",
                                             value=prompts.EXTRACT_TEMPLATE, lines=3)
                     a_out_res = resolution_slider("Разрешение")
                     a_go = gr.Button("Сгенерировать", variant="primary")
@@ -425,6 +434,10 @@ def build_ui() -> gr.Blocks:
                 if mode == "extract":
                     return (gr.update(label="Что вырезать", placeholder="the red sports car", value=""),
                             prompts.EXTRACT_TEMPLATE)
+                if mode == "background":
+                    return (gr.update(label="Фон / сцена",
+                                      placeholder="a loft-style living room with brick walls and large windows",
+                                      value=""), prompts.BACKGROUND_TEMPLATE)
                 return (gr.update(label="Правка слоя", placeholder='Change the text on the sticker to "HELLO"',
                                   value=""), prompts.LAYER_EDIT_TEMPLATE)
 

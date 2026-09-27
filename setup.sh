@@ -15,6 +15,8 @@
 #   QWEN_PUBLIC=0         без публичной ссылки (Cloudflare quick tunnel, без пароля — доступ у любого со ссылкой)
 #   QWEN_DOWNLOAD=0       не качать веса заранее (скачаются при первом запуске приложения)
 #   QWEN_TURBO=0          без turbo-LoRA
+#   QWEN_GGUF=<файл>      GGUF-квант трансформера из QWEN_GGUF_REPO (по умолчанию qwen-image-2.1-UC-Q8_0.gguf, ~7 GB;
+#                         qwen-image-2.1-UC-Q4_K_M.gguf — ~4.3 GB); QWEN_GGUF=none — оригинальный bf16 (~14 GB)
 #   QWEN_PORT=17860       внутренний порт приложения (слушает только 127.0.0.1)
 #   QWEN_VENV=<путь>      venv для установки; по умолчанию /venv/main (образы Vast), иначе ./.venv
 # Остальные настройки приложения (QWEN_OFFLOAD, QWEN_MODEL_ID, …, см. README) на Vast читаются из
@@ -30,6 +32,9 @@ TURBO="${QWEN_TURBO:-1}"
 MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen-Image-2.1}"
 TURBO_REPO="${QWEN_TURBO_REPO:-Viggle/Qwen-Image-2.1-viggle-turbo}"
 TURBO_WEIGHTS="Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors"
+GGUF_REPO="${QWEN_GGUF_REPO:-abenzerps/Qwen-Image-2.1-Uncensored-GGUF}"
+GGUF="${QWEN_GGUF:-qwen-image-2.1-UC-Q8_0.gguf}"
+[[ "${GGUF,,}" == none || "$GGUF" == 0 ]] && GGUF=""
 VAST=0
 [[ -d /opt/supervisor-scripts/utils && -d /etc/supervisor/conf.d ]] && command -v supervisorctl >/dev/null && VAST=1
 
@@ -48,7 +53,8 @@ fi
 cache_dir="${HF_HOME:-$HOME/.cache/huggingface}"
 while [[ ! -d "$cache_dir" ]]; do cache_dir="$(dirname "$cache_dir")"; done   # кэша может ещё не быть
 free_gb=$(df -BG --output=avail "$cache_dir" | tail -1 | tr -dc '0-9')
-[[ "$DOWNLOAD" == 1 && "$free_gb" -lt 40 ]] && warn "Свободно ${free_gb} GB в $cache_dir, а весам нужно ~33 GB"
+need_gb=$([[ -n "$GGUF" ]] && echo 26 || echo 33)
+[[ "$DOWNLOAD" == 1 && "$free_gb" -lt $((need_gb + 5)) ]] && warn "Свободно ${free_gb} GB в $cache_dir, а весам нужно ~${need_gb} GB"
 echo "Режим: $([[ $VAST == 1 ]] && echo 'Vast.ai (supervisor)' || echo 'обычная машина (nohup)')"
 
 # --------------------------------------------------------------------------- #
@@ -79,11 +85,19 @@ EOF
 
 # --------------------------------------------------------------------------- #
 if [[ "$DOWNLOAD" == 1 ]]; then
-    step "Веса модели (~31 GB$([[ $TURBO == 1 ]] && echo ' + turbo-LoRA 1.3 GB'))"
     export HF_XET_HIGH_PERFORMANCE=1
     HF="$VENV/bin/hf"
     [[ -x "$HF" ]] || die "Не найден $HF (ставится вместе с huggingface_hub)"
-    "$HF" download "$MODEL_ID" --quiet >/dev/null
+    if [[ -n "$GGUF" ]]; then
+        step "Веса модели: $GGUF + энкодер и VAE (~25 GB$([[ $TURBO == 1 ]] && echo ' + turbo-LoRA 1.3 GB'))"
+        "$HF" download "$GGUF_REPO" "$GGUF" --quiet >/dev/null
+        echo "$GGUF_REPO/$GGUF — готово"
+        # bf16-трансформер (~14 GB) не нужен — из базового репозитория только энкодер, VAE и конфиги.
+        "$HF" download "$MODEL_ID" --exclude "transformer/*.safetensors" --quiet >/dev/null
+    else
+        step "Веса модели (~31 GB$([[ $TURBO == 1 ]] && echo ' + turbo-LoRA 1.3 GB'))"
+        "$HF" download "$MODEL_ID" --quiet >/dev/null
+    fi
     echo "$MODEL_ID — готово"
     if [[ "$TURBO" == 1 ]]; then
         "$HF" download "$TURBO_REPO" "$TURBO_WEIGHTS" scheduler/scheduler_config.json LICENSE --quiet >/dev/null

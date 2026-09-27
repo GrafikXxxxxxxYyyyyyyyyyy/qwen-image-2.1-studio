@@ -1,13 +1,16 @@
 # Qwen-Image-2.1 Studio
 
-Gradio-интерфейс ко всем возможностям [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1):
+Gradio-интерфейс ко всем возможностям [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1).
+По умолчанию трансформер — GGUF-квант Q8_0 uncensored-версии
+([abenzerps/Qwen-Image-2.1-Uncensored-GGUF](https://huggingface.co/abenzerps/Qwen-Image-2.1-Uncensored-GGUF)),
+поэтому всё работает на 24 GB (RTX 3090/4090). Модель без фильтров контента.
 
 | Вкладка | Что делает | Статус |
 |---|---|---|
 | Текст → изображение | Любой размер от 256 до 3072 px по каждой стороне (ползунки, кратно 32), RGBA по галочке | официальный API |
 | Редактирование и референсы | Правка по инструкции, композиция из 1–10 картинок (`<image1>`, `<image2>`…), размер «как у №N» или вручную | официальный API |
 | Локальная правка | Обвести/закрасить область кистью → пометкой на картинке или отдельной маской | **шаблон промпта — наша догадка** |
-| Прозрачность | Вырезать объект из фото, изменить прозрачный слой | **шаблон промпта — наша догадка** |
+| Прозрачность | Вырезать объект из фото, изменить прозрачный слой, дорисовать фон вокруг вырезанного объекта | **шаблон промпта — наша догадка** |
 | ✨ Переписать промпт | Официальные модели Qwen-Image-2.1-PE-T2I / PE-I2I, заодно подбирают пропорции (пересчитываются в ширину и высоту) | нужен отдельный запуск (см. ниже) |
 
 Общие параметры (⚡ turbo, шаги, seed, число картинок, KV-кэш, CFG + negative prompt) — в боковой панели.
@@ -40,7 +43,7 @@ git clone https://github.com/GrafikXxxxxxxYyyyyyyyyyy/qwen-image-2.1-studio.git
 cd qwen-image-2.1-studio && bash setup.sh
 ```
 
-`setup.sh` ставит зависимости, качает веса (~33 GB вместе с turbo-LoRA), запускает приложение и открывает
+`setup.sh` ставит зависимости, качает веса (~26 GB вместе с turbo-LoRA), запускает приложение и открывает
 публичную ссылку через Cloudflare quick tunnel (**без пароля**: GPU доступен любому, у кого есть ссылка;
 `QWEN_PUBLIC=0` — без ссылки). В конце печатает адрес. На Vast.ai приложение и туннель ставятся сервисами
 supervisor (`qwen-studio`, `qwen-studio-tunnel`), на других машинах — фоновыми процессами с логами в `logs/`.
@@ -50,12 +53,19 @@ supervisor (`qwen-studio`, `qwen-studio-tunnel`), на других машина
 ## Запуск на GPU-сервере вручную
 
 **Железо:**
-- диск: ~31 GB под модель + 1.3 GB turbo-LoRA (+ ~19 GB на каждую PE-модель);
+- диск: ~7 GB GGUF Q8_0 + ~18 GB энкодер и VAE + 1.3 GB turbo-LoRA (с `QWEN_GGUF=none` — ~31 GB вместо первых двух;
+  + ~19 GB на каждую PE-модель);
 - 80 GB VRAM (A100/H100) — всё в видеопамяти (`none`), влезает и локальный PE (оценка, не проверял);
-- 48 GB (A6000/L40S) — `encoder`: трансформер и VAE в видеопамяти, текстовый энкодер в RAM (выбирается сам);
-- 24 GB (3090/4090) — `model` или `sequential`, заметно медленнее; нужно ≥ 64 GB RAM (оценка, не проверял).
+- 24–48 GB (3090/4090/A6000/L40S) — `encoder`: трансформер и VAE в видеопамяти, текстовый энкодер (~17 GB)
+  в RAM, выбирается сам. На картах меньше 40 GB вывод крупнее 1280² сразу декодируется тайлами;
+- RAM: ≥ 32 GB (оценка, не проверял);
+- с `QWEN_GGUF=none` (bf16, 14 GB) на 24 GB остаётся только `model`/`sequential` — заметно медленнее.
 
-Замеры на RTX A6000 48 GB (`encoder`, одна картинка, включая энкодер и декодирование):
+Замеры GGUF Q8_0 с ограничением памяти процесса до 24 GB, как на 3090 (A6000, `encoder`, turbo-LoRA загружена;
+на самой 3090 не проверял): 1024² — turbo 7 с / база 38 с, пик 16 GB; редактирование с референсом — пик 18 GB;
+1280² — пик 19.5 GB; 2048² тайлами — turbo 34 с, пик 12 GB.
+
+Замеры bf16 (`QWEN_GGUF=none`) на RTX A6000 48 GB (`encoder`, одна картинка, включая энкодер и декодирование):
 
 | | 1024×1024 | 2752×1536 |
 |---|---|---|
@@ -69,7 +79,9 @@ rsync -av --exclude .venv --exclude outputs ./ user@server:~/qwen-studio/   # с
 cd ~/qwen-studio
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-hf download Qwen/Qwen-Image-2.1        # необязательно: скачать веса заранее (~35 GB)
+# необязательно: скачать веса заранее (~25 GB)
+hf download abenzerps/Qwen-Image-2.1-Uncensored-GGUF qwen-image-2.1-UC-Q8_0.gguf
+hf download Qwen/Qwen-Image-2.1 --exclude "transformer/*.safetensors"
 python app.py --host 127.0.0.1 --port 7860
 ```
 
@@ -87,8 +99,10 @@ ssh -L 7860:localhost:7860 user@server
 | Переменная | По умолчанию | Смысл |
 |---|---|---|
 | `QWEN_MOCK` | — | `1` — заглушка вместо модели |
-| `QWEN_MODEL_ID` | `Qwen/Qwen-Image-2.1` | id на Hub или локальная папка |
-| `QWEN_OFFLOAD` | `auto` | `none` / `encoder` / `model` / `sequential`; `auto` = `none` при ≥ 64 GB VRAM, `encoder` при ≥ 40 GB, иначе `model` |
+| `QWEN_MODEL_ID` | `Qwen/Qwen-Image-2.1` | id на Hub или локальная папка; с GGUF отсюда берутся энкодер, VAE и конфиги |
+| `QWEN_GGUF` | `qwen-image-2.1-UC-Q8_0.gguf` | файл трансформера в `QWEN_GGUF_REPO` (например `qwen-image-2.1-UC-Q4_K_M.gguf`, ~4.3 GB, чуть медленнее); `none` — bf16-трансформер из `QWEN_MODEL_ID` |
+| `QWEN_GGUF_REPO` | `abenzerps/Qwen-Image-2.1-Uncensored-GGUF` | репозиторий с GGUF |
+| `QWEN_OFFLOAD` | `auto` | `none` / `encoder` / `model` / `sequential`; `auto` = `none` при ≥ 64 GB VRAM, `encoder` при ≥ 20 GB с GGUF (≥ 40 GB с bf16), иначе `model` |
 | `QWEN_TURBO` | `1` | `0` — не загружать turbo-LoRA ([Viggle/Qwen-Image-2.1-viggle-turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo)) |
 | `QWEN_COMPILE` | — | `1` — flex attention + `torch.compile`. На torch 2.11 падает в Inductor (`'function' object has no attribute 'graph'`) |
 | `QWEN_OUTPUT_DIR` | `outputs` | куда сохранять результаты |
@@ -126,4 +140,4 @@ Qwen показывает локальные правки (круги, поме�
 
 ## Лицензия
 
-Модель и код из `prompt_rewrite/` — Qwen Research License: **только некоммерческое использование**.
+Модель (и GGUF-кванты), turbo-LoRA и код из `prompt_rewrite/` — Qwen Research License: **только некоммерческое использование**.

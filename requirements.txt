@@ -5,6 +5,7 @@ transformers>=5.17
 diffusers @ git+https://github.com/huggingface/diffusers@e0118ade2f60234c41bacf40330a7e2f61108849
 accelerate
 peft  # turbo-LoRA (QWEN_TURBO=1)
+gguf>=0.10  # GGUF-трансформер (QWEN_GGUF)
 huggingface_hub
 gradio>=6.28,<7
 pillow>=10.1
